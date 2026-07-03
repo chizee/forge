@@ -72,6 +72,7 @@ class VLLMClient:
         recommended_sampling: bool = False,
         api_key: str = "",
         extra_headers: dict[str, str] | None = None,
+        adopt_served_identity: bool = True,
     ) -> None:
         self.base_url = base_url
         # Two identity roles, set together (see _set_model_identity):
@@ -82,6 +83,11 @@ class VLLMClient:
         #   self.sampling_key — the derived registry-lookup key for
         #                       apply_sampling_defaults below (must be set first).
         self._set_model_identity(model_path)
+        # Whether external-mode discovery may replace the identity above with
+        # the backend-reported served name. The proxy sets this False when the
+        # user pinned an explicit --model (issue #122): an explicit identity is
+        # never overwritten, only warned about on mismatch.
+        self._adopt_served_identity = adopt_served_identity
 
         # Apply per-model recommended sampling defaults. Caller's explicit
         # (non-None) kwargs win over the map field-by-field.
@@ -472,9 +478,15 @@ class VLLMClient:
         vLLM exposes ``max_model_len`` (context budget) and the served model
         ``id`` (the wire ``model`` field it validates) on the same endpoint, so
         one credentialed GET yields both — collapsing the two separate startup
-        round-trips. The served id is adopted into this client immediately
-        (``_set_model_identity``), and the budget is returned for the caller to
-        apply to the context manager.
+        round-trips. When ``adopt_served_identity`` (construction), the served
+        id is adopted into this client immediately (``_set_model_identity``);
+        when the identity was pinned explicitly it is never overwritten. The
+        budget is returned for the caller to apply to the context manager —
+        when pinned, it is read from the pinned model's OWN entry (on
+        multi-model gateways ``data[0]`` is arbitrary), and a pinned name the
+        backend doesn't list raises: any other entry's budget would have wrong
+        provenance, and this method is only called when a budget is actually
+        needed (an explicit budget skips the probe entirely).
 
         Both fields are required: vLLM 404s every request without a valid served
         id, and a missing ``max_model_len`` leaves the budget undiscoverable —
@@ -493,17 +505,40 @@ class VLLMClient:
         models = resp.json().get("data") or []
         if not models:
             raise BackendError(500, "vLLM /v1/models returned no entries")
-        entry = models[0]
 
-        served = entry.get("id")
-        if not served:
-            raise BackendError(500, f"vLLM /v1/models entry missing id: {entry}")
-        logger.info("Discovered vLLM served model name: %s", served)
-        self._set_model_identity(served)
+        if self._adopt_served_identity:
+            entry = models[0]
+            served = entry.get("id")
+            if not served:
+                raise BackendError(500, f"vLLM /v1/models entry missing id: {entry}")
+            logger.info("Discovered vLLM served model name: %s", served)
+            self._set_model_identity(served)
+        else:
+            # Identity pinned at construction (proxy --model): never overwrite.
+            # The budget must come from the pinned model's own entry — on a
+            # multi-model gateway data[0] is arbitrary, so a fallback budget
+            # would silently mis-size the context window. No entry, no budget:
+            # fail loud and name the escape hatch.
+            entry_or_none = next(
+                (m for m in models if m.get("id") == self.model), None,
+            )
+            if entry_or_none is None:
+                raise BackendError(
+                    500,
+                    f"explicit model {self.model!r} is not among the "
+                    f"{len(models)} backend-served ids (first ids: "
+                    f"{[m.get('id') for m in models[:5]]}); cannot discover its "
+                    "context budget — pass an explicit budget (--budget-tokens) "
+                    "or fix the model name",
+                )
+            entry = entry_or_none
 
         max_model_len = entry.get("max_model_len")
         if max_model_len is None:
             raise BackendError(
-                500, f"vLLM /v1/models entry missing max_model_len: {entry}",
+                500,
+                f"vLLM /v1/models entry missing max_model_len: {entry} — pass "
+                "an explicit budget (--budget-tokens) if the backend doesn't "
+                "report one",
             )
         return int(max_model_len)

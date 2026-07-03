@@ -16,6 +16,7 @@ from forge.clients.llamafile import LlamafileClient
 from forge.clients.ollama import OllamaClient
 from forge.clients.vllm import VLLMClient
 from forge.context.manager import ContextManager
+from forge.errors import BackendError
 from forge.proxy.proxy import ProxyServer
 from forge.server import BudgetMode
 
@@ -201,6 +202,123 @@ class TestSetupExternal:
         assert client.model == "default"
 
     @pytest.mark.asyncio
+    async def test_vllm_eager_pinned_no_budget_single_discovery_probe(self) -> None:
+        # Static key + pinned model + no explicit budget: the eager path takes
+        # ONE credentialed discover_backend_metadata probe (which honors the
+        # pin and reads the pinned entry's budget) — never the separate
+        # served-name/context-length probes that read data[0].
+        proxy = ProxyServer(
+            backend_url="http://localhost:8000", backend="vllm",
+            backend_api_key="K", model="nv-mistral-large",
+        )
+        with patch.object(
+            VLLMClient, "discover_backend_metadata",
+            new_callable=AsyncMock, return_value=128000,
+        ) as discover, patch.object(
+            VLLMClient, "get_served_model_name", new_callable=AsyncMock,
+        ) as served, patch.object(
+            VLLMClient, "get_context_length", new_callable=AsyncMock,
+        ) as ctxlen:
+            client, ctx, lazy = await proxy._setup_external()
+        discover.assert_awaited_once()
+        served.assert_not_awaited()
+        ctxlen.assert_not_awaited()
+        assert lazy is None
+        assert ctx.budget_tokens == 128000
+        assert client.model == "nv-mistral-large"
+
+    @pytest.mark.asyncio
+    async def test_vllm_eager_unpinned_no_budget_single_discovery_probe(self) -> None:
+        # Same single-probe collapse without a pin: identity adoption happens
+        # inside discover_backend_metadata (client-level tested).
+        proxy = ProxyServer(
+            backend_url="http://localhost:8000", backend="vllm",
+            backend_api_key="K",
+        )
+        with patch.object(
+            VLLMClient, "discover_backend_metadata",
+            new_callable=AsyncMock, return_value=113000,
+        ) as discover, patch.object(
+            VLLMClient, "get_served_model_name", new_callable=AsyncMock,
+        ) as served:
+            _, ctx, lazy = await proxy._setup_external()
+        discover.assert_awaited_once()
+        served.assert_not_awaited()
+        assert lazy is None
+        assert ctx.budget_tokens == 113000
+
+    @pytest.mark.asyncio
+    async def test_vllm_eager_pinned_unlisted_raise_propagates(self) -> None:
+        # The fail-loud raise for a pinned-but-unlisted model must surface at
+        # startup — _setup_external must not swallow it into a soft fallback.
+        proxy = ProxyServer(
+            backend_url="http://localhost:8000", backend="vllm",
+            backend_api_key="K", model="nv-mistral-large",
+        )
+        with patch.object(
+            VLLMClient, "discover_backend_metadata",
+            new_callable=AsyncMock,
+            side_effect=BackendError(
+                500, "explicit model 'nv-mistral-large' is not among ...",
+            ),
+        ), pytest.raises(BackendError, match="not among"):
+            await proxy._setup_external()
+
+    @pytest.mark.asyncio
+    async def test_vllm_empty_model_is_not_a_pin(self) -> None:
+        # A blank --model is normalized away: discovery behaves exactly as if
+        # no model was given (placeholder + adoption), instead of pinning
+        # "default" with adoption suppressed.
+        proxy = ProxyServer(
+            backend_url="http://localhost:8000", backend="vllm",
+            budget_tokens=8192, backend_api_key="K",
+            model="  ",
+        )
+        with patch.object(
+            VLLMClient, "get_served_model_name",
+            new_callable=AsyncMock, return_value="my-awq-model",
+        ):
+            client, _, _ = await proxy._setup_external()
+        assert client.model == "my-awq-model"
+        assert client._adopt_served_identity is True
+
+    @pytest.mark.asyncio
+    async def test_vllm_explicit_model_skips_eager_adoption(self) -> None:
+        # Issue #122: an explicit --model pins the identity — the eager
+        # served-name probe is skipped entirely, never adopted over the pin.
+        proxy = ProxyServer(
+            backend_url="http://localhost:8000", backend="vllm",
+            budget_tokens=8192, backend_api_key="K",
+            model="nv-mistral-large",
+        )
+        with patch.object(
+            VLLMClient, "get_served_model_name", new_callable=AsyncMock,
+        ) as served:
+            client, _, _ = await proxy._setup_external()
+        served.assert_not_awaited()
+        assert client.model == "nv-mistral-large"
+        assert client.sampling_key == "nv-mistral-large"
+        assert client._adopt_served_identity is False
+
+    @pytest.mark.asyncio
+    async def test_vllm_explicit_repo_id_model_derives_registry_key(self) -> None:
+        # A pinned HF-repo-id reaches the wire verbatim; the registry key is
+        # the derived stem — the (model, sampling_key) invariant, applied at
+        # construction instead of served-name adoption.
+        proxy = ProxyServer(
+            backend_url="http://localhost:8000", backend="vllm",
+            budget_tokens=8192, backend_api_key="K",
+            model="google/gemma-4-26B-A4B-it",
+        )
+        with patch.object(
+            VLLMClient, "get_served_model_name", new_callable=AsyncMock,
+        ) as served:
+            client, _, _ = await proxy._setup_external()
+        served.assert_not_awaited()
+        assert client.model == "google/gemma-4-26B-A4B-it"
+        assert client.sampling_key == "gemma-4-26B-A4B-it"
+
+    @pytest.mark.asyncio
     async def test_url_v1_suffix_preserved(self) -> None:
         proxy = ProxyServer(backend_url="http://localhost:8080/v1", budget_tokens=8192)
         client, _, _ = await proxy._setup_external()
@@ -296,6 +414,45 @@ class TestExternalDeferredDiscovery:
         _, ctx, lazy = await proxy._setup_external()
         assert lazy is None
         assert ctx.budget_tokens == 4096
+
+    @pytest.mark.asyncio
+    async def test_vllm_passthrough_pinned_model_and_budget_not_deferred(self) -> None:
+        # Issue #122: pinned identity + explicit budget = nothing left to
+        # discover — passthrough vLLM starts with zero metadata probes.
+        proxy = ProxyServer(
+            backend_url="http://localhost:8000", backend="vllm",
+            budget_tokens=4096, model="nv-mistral-large",
+        )
+        with patch.object(
+            VLLMClient, "get_served_model_name", new_callable=AsyncMock,
+        ) as served, patch.object(
+            VLLMClient, "get_context_length", new_callable=AsyncMock,
+        ) as ctxlen:
+            client, ctx, lazy = await proxy._setup_external()
+        served.assert_not_awaited()
+        ctxlen.assert_not_awaited()
+        assert lazy is None
+        assert ctx.budget_tokens == 4096
+        assert client.model == "nv-mistral-large"
+
+    @pytest.mark.asyncio
+    async def test_vllm_passthrough_pinned_model_no_budget_still_defers(self) -> None:
+        # Pinned identity but no budget and no key: deferral still happens for
+        # budget discovery; the pin survives it (adopt_served_identity False).
+        proxy = ProxyServer(
+            backend_url="http://localhost:8000", backend="vllm",
+            model="nv-mistral-large",
+        )
+        with patch.object(
+            VLLMClient, "get_served_model_name", new_callable=AsyncMock,
+        ) as served:
+            client, _, lazy = await proxy._setup_external()
+        served.assert_not_awaited()
+        assert lazy is not None
+        assert lazy.deferred is True
+        assert lazy.apply_budget is True
+        assert client.model == "nv-mistral-large"
+        assert client._adopt_served_identity is False
 
     @pytest.mark.asyncio
     async def test_static_key_is_eager_not_deferred(self) -> None:
