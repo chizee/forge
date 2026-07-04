@@ -262,6 +262,180 @@ class TestSend:
         assert exc.value.status_code == 401
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("field", ["reasoning_content", "reasoning", "reasoning_text"])
+    async def test_structured_reasoning_field_captured(self, field) -> None:
+        # #114: reasoning from any canonical structured field is attached to
+        # the ToolCall (covers all of REASONING_MESSAGE_FIELDS).
+        client = _make_client()
+        client._http.post.return_value = _mock_response({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    field: "I should check the price first.",
+                    "tool_calls": [{
+                        "function": {"name": "get_pricing", "arguments": '{"part": "X"}'},
+                    }],
+                }
+            }]
+        })
+        result = await client.send([{"role": "user", "content": "test"}], tools=[_make_spec()])
+        assert isinstance(result, list)
+        assert result[0].reasoning == "I should check the price first."
+
+    @pytest.mark.asyncio
+    async def test_extracts_think_tags_from_content_with_tool_call(self) -> None:
+        # #114: no structured field, thinking inline in content <think> tags is
+        # captured as reasoning.
+        client = _make_client()
+        client._http.post.return_value = _mock_response({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "<think>plan</think>",
+                    "tool_calls": [{
+                        "function": {"name": "get_pricing", "arguments": '{"part": "X"}'},
+                    }],
+                }
+            }]
+        })
+        result = await client.send([{"role": "user", "content": "test"}], tools=[_make_spec()])
+        assert isinstance(result, list)
+        assert result[0].reasoning == "plan"
+
+    @pytest.mark.asyncio
+    async def test_reasoning_field_preferred_over_content_tags(self) -> None:
+        # Structured field wins over <think> tags in content.
+        client = _make_client()
+        client._http.post.return_value = _mock_response({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "<think>inline</think>",
+                    "reasoning": "structured",
+                    "tool_calls": [{
+                        "function": {"name": "get_pricing", "arguments": '{"part": "X"}'},
+                    }],
+                }
+            }]
+        })
+        result = await client.send([{"role": "user", "content": "test"}], tools=[_make_spec()])
+        assert result[0].reasoning == "structured"
+
+    @pytest.mark.asyncio
+    async def test_content_preamble_not_treated_as_reasoning(self) -> None:
+        # #114 NEGATIVE (locked, no raw-content fallback): a plain content
+        # preamble alongside a tool call — no structured field, no <think>
+        # tags — must NOT be captured as reasoning. Labeling hosted-provider
+        # preambles as reasoning would mis-route a real assistant turn.
+        client = _make_client()
+        client._http.post.return_value = _mock_response({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Let me look that up.",
+                    "tool_calls": [{
+                        "function": {"name": "get_pricing", "arguments": '{"part": "X"}'},
+                    }],
+                }
+            }]
+        })
+        result = await client.send([{"role": "user", "content": "test"}], tools=[_make_spec()])
+        assert isinstance(result, list)
+        assert result[0].reasoning is None
+
+    @pytest.mark.asyncio
+    async def test_think_tags_stripped_from_text_response(self) -> None:
+        # Bare text (no tool call): <think> tags are stripped from the
+        # TextResponse content (parity with vLLM/Ollama).
+        client = _make_client()
+        client._http.post.return_value = _mock_response({
+            "choices": [{"message": {
+                "role": "assistant",
+                "content": "<think>x</think>The answer is 42.",
+            }}]
+        })
+        result = await client.send([{"role": "user", "content": "test"}])
+        assert isinstance(result, TextResponse)
+        assert result.content == "The answer is 42."
+
+    @pytest.mark.asyncio
+    async def test_plain_preamble_text_response_survives(self) -> None:
+        # A plain text reply with no tags is returned verbatim (strip only
+        # removes tags — content survives).
+        client = _make_client()
+        client._http.post.return_value = _mock_response({
+            "choices": [{"message": {
+                "role": "assistant",
+                "content": "Let me look that up.",
+            }}]
+        })
+        result = await client.send([{"role": "user", "content": "test"}])
+        assert isinstance(result, TextResponse)
+        assert result.content == "Let me look that up."
+
+    @pytest.mark.asyncio
+    async def test_reasoning_attached_to_first_tool_call_only(self) -> None:
+        # Reasoning is attached to the first ToolCall only; siblings get None.
+        client = _make_client()
+        client._http.post.return_value = _mock_response({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "reasoning": "because",
+                    "tool_calls": [
+                        {"function": {"name": "get_pricing", "arguments": '{"part": "A"}'}},
+                        {"function": {"name": "get_pricing", "arguments": '{"part": "B"}'}},
+                    ],
+                }
+            }]
+        })
+        result = await client.send([{"role": "user", "content": "test"}], tools=[_make_spec()])
+        assert isinstance(result, list)
+        assert result[0].reasoning == "because"
+        assert result[1].reasoning is None
+
+    @pytest.mark.asyncio
+    async def test_empty_string_structured_field_falls_through_to_tags(self) -> None:
+        # An empty-string structured field is not a capture: resolution falls
+        # through to <think> extraction (the falsy-skip is load-bearing).
+        client = _make_client()
+        client._http.post.return_value = _mock_response({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "reasoning": "",
+                    "content": "<think>plan</think>",
+                    "tool_calls": [{
+                        "function": {"name": "get_pricing", "arguments": '{"part": "X"}'},
+                    }],
+                }
+            }]
+        })
+        result = await client.send([{"role": "user", "content": "test"}], tools=[_make_spec()])
+        assert isinstance(result, list)
+        assert result[0].reasoning == "plan"
+
+    @pytest.mark.asyncio
+    async def test_non_string_reasoning_field_raises(self) -> None:
+        # Fail loud on provider block-structured reasoning: never repr-coerce
+        # it into replayable chain-of-thought.
+        client = _make_client()
+        client._http.post.return_value = _mock_response({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "reasoning": [{"type": "text", "text": "block"}],
+                    "tool_calls": [{
+                        "function": {"name": "get_pricing", "arguments": '{"part": "X"}'},
+                    }],
+                }
+            }]
+        })
+        with pytest.raises(BackendError, match="not a string"):
+            await client.send([{"role": "user", "content": "test"}], tools=[_make_spec()])
+
+    @pytest.mark.asyncio
     async def test_records_usage(self) -> None:
         client = _make_client()
         client._http.post.return_value = _mock_response({
@@ -396,6 +570,173 @@ class TestSendStream:
         assert len(finals) == 1
         assert isinstance(finals[0].response, list)
         assert finals[0].response[0].args == {"part": "X9"}
+
+    @pytest.mark.asyncio
+    async def test_accumulates_reasoning_across_deltas(self) -> None:
+        # #114 (streaming): structured reasoning deltas accumulate across chunks
+        # and land on the FINAL tool call's reasoning.
+        client = _make_client()
+        lines = [
+            'data: ' + json.dumps({"choices": [{"delta": {"reasoning": "Let me "}}]}),
+            'data: ' + json.dumps({"choices": [{"delta": {"reasoning": "think... "}}]}),
+            'data: ' + json.dumps({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"name": "get_pricing", "arguments": '{"part": "X"}'}}
+            ]}}]}),
+            'data: [DONE]',
+        ]
+        client._http.stream.return_value = _MockStreamResponse(lines)
+        chunks = [c async for c in client.send_stream(
+            [{"role": "user", "content": "test"}], tools=[_make_spec()]
+        )]
+        finals = [c for c in chunks if c.type == ChunkType.FINAL]
+        assert len(finals) == 1
+        result = finals[0].response
+        assert isinstance(result, list)
+        assert result[0].reasoning == "Let me think... "
+
+    @pytest.mark.asyncio
+    async def test_stream_extracts_think_tags_from_content_with_tool_call(self) -> None:
+        # #114 (streaming): <think> tags straddling chunk boundaries are
+        # accumulated then extracted once at the end.
+        client = _make_client()
+        lines = [
+            'data: ' + json.dumps({"choices": [{"delta": {"content": "<think>inline "}}]}),
+            'data: ' + json.dumps({"choices": [{"delta": {"content": "plan</think>"}}]}),
+            'data: ' + json.dumps({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"name": "get_pricing", "arguments": '{"part": "X"}'}}
+            ]}}]}),
+            'data: [DONE]',
+        ]
+        client._http.stream.return_value = _MockStreamResponse(lines)
+        chunks = [c async for c in client.send_stream(
+            [{"role": "user", "content": "test"}], tools=[_make_spec()]
+        )]
+        finals = [c for c in chunks if c.type == ChunkType.FINAL]
+        assert len(finals) == 1
+        result = finals[0].response
+        assert isinstance(result, list)
+        assert result[0].reasoning == "inline plan"
+
+    @pytest.mark.asyncio
+    async def test_stream_content_preamble_not_treated_as_reasoning(self) -> None:
+        # #114 NEGATIVE (streaming): plain content deltas (no tags, no
+        # structured field) alongside a tool call → reasoning stays None.
+        client = _make_client()
+        lines = [
+            'data: ' + json.dumps({"choices": [{"delta": {"content": "Let me "}}]}),
+            'data: ' + json.dumps({"choices": [{"delta": {"content": "look that up."}}]}),
+            'data: ' + json.dumps({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"name": "get_pricing", "arguments": '{"part": "X"}'}}
+            ]}}]}),
+            'data: [DONE]',
+        ]
+        client._http.stream.return_value = _MockStreamResponse(lines)
+        chunks = [c async for c in client.send_stream(
+            [{"role": "user", "content": "test"}], tools=[_make_spec()]
+        )]
+        finals = [c for c in chunks if c.type == ChunkType.FINAL]
+        assert len(finals) == 1
+        result = finals[0].response
+        assert isinstance(result, list)
+        assert result[0].reasoning is None
+
+    @pytest.mark.asyncio
+    async def test_stream_strips_think_tags_from_text_response(self) -> None:
+        # #114 (streaming): with no tool call, <think> tags are stripped from
+        # the FINAL TextResponse content.
+        client = _make_client()
+        lines = [
+            'data: ' + json.dumps({"choices": [{"delta": {"content": "<think>x</think>"}}]}),
+            'data: ' + json.dumps({"choices": [{"delta": {"content": "The answer is 42."}}]}),
+            'data: [DONE]',
+        ]
+        client._http.stream.return_value = _MockStreamResponse(lines)
+        chunks = [c async for c in client.send_stream([{"role": "user", "content": "test"}])]
+        finals = [c for c in chunks if c.type == ChunkType.FINAL]
+        assert len(finals) == 1
+        assert isinstance(finals[0].response, TextResponse)
+        assert finals[0].response.content == "The answer is 42."
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("field", ["reasoning_content", "reasoning_text"])
+    async def test_stream_other_canonical_fields_accumulate(self, field) -> None:
+        # The stream loop's own field walk covers every canonical name, not
+        # just "reasoning" (pins the multi-field loop against refactor).
+        client = _make_client()
+        lines = [
+            'data: ' + json.dumps({"choices": [{"delta": {field: "step one "}}]}),
+            'data: ' + json.dumps({"choices": [{"delta": {field: "step two"}}]}),
+            'data: ' + json.dumps({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"name": "get_pricing", "arguments": '{"part": "X"}'}}
+            ]}}]}),
+            'data: [DONE]',
+        ]
+        client._http.stream.return_value = _MockStreamResponse(lines)
+        chunks = [c async for c in client.send_stream(
+            [{"role": "user", "content": "test"}], tools=[_make_spec()]
+        )]
+        finals = [c for c in chunks if c.type == ChunkType.FINAL]
+        assert isinstance(finals[0].response, list)
+        assert finals[0].response[0].reasoning == "step one step two"
+
+    @pytest.mark.asyncio
+    async def test_stream_structured_preferred_over_content_tags(self) -> None:
+        # Streaming precedence mirrors send(): structured deltas win over
+        # <think> tags accumulated in content.
+        client = _make_client()
+        lines = [
+            'data: ' + json.dumps({"choices": [{"delta": {"reasoning": "structured"}}]}),
+            'data: ' + json.dumps({"choices": [{"delta": {"content": "<think>inline</think>"}}]}),
+            'data: ' + json.dumps({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"name": "get_pricing", "arguments": '{"part": "X"}'}}
+            ]}}]}),
+            'data: [DONE]',
+        ]
+        client._http.stream.return_value = _MockStreamResponse(lines)
+        chunks = [c async for c in client.send_stream(
+            [{"role": "user", "content": "test"}], tools=[_make_spec()]
+        )]
+        finals = [c for c in chunks if c.type == ChunkType.FINAL]
+        assert isinstance(finals[0].response, list)
+        assert finals[0].response[0].reasoning == "structured"
+
+    @pytest.mark.asyncio
+    async def test_stream_reasoning_first_tool_call_only(self) -> None:
+        # Streaming parity with send(): reasoning lands on the first ToolCall
+        # only; siblings get None.
+        client = _make_client()
+        lines = [
+            'data: ' + json.dumps({"choices": [{"delta": {"reasoning": "because"}}]}),
+            'data: ' + json.dumps({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"name": "get_pricing", "arguments": '{"part": "A"}'}},
+                {"index": 1, "function": {"name": "get_pricing", "arguments": '{"part": "B"}'}},
+            ]}}]}),
+            'data: [DONE]',
+        ]
+        client._http.stream.return_value = _MockStreamResponse(lines)
+        chunks = [c async for c in client.send_stream(
+            [{"role": "user", "content": "test"}], tools=[_make_spec()]
+        )]
+        finals = [c for c in chunks if c.type == ChunkType.FINAL]
+        assert isinstance(finals[0].response, list)
+        assert finals[0].response[0].reasoning == "because"
+        assert finals[0].response[1].reasoning is None
+
+    @pytest.mark.asyncio
+    async def test_stream_non_string_reasoning_raises(self) -> None:
+        # Fail loud in streaming too: a block-structured reasoning delta is
+        # never repr-coerced into chain-of-thought.
+        client = _make_client()
+        lines = [
+            'data: ' + json.dumps({"choices": [{"delta": {
+                "reasoning": [{"type": "text", "text": "block"}],
+            }}]}),
+            'data: [DONE]',
+        ]
+        client._http.stream.return_value = _MockStreamResponse(lines)
+        with pytest.raises(BackendError, match="not a string"):
+            async for _ in client.send_stream([{"role": "user", "content": "test"}]):
+                pass
 
     @pytest.mark.asyncio
     async def test_stream_http_error_raises(self) -> None:
