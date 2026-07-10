@@ -24,6 +24,10 @@ class WriteParams(BaseModel):
     content: str = Field(description="File body")
 
 
+class _NoRequiredParams(BaseModel):
+    note: str | None = Field(default=None, description="Optional note")
+
+
 def _make_write_spec() -> ToolSpec:
     return ToolSpec(name="write", description="Write a file", parameters=WriteParams)
 
@@ -34,6 +38,39 @@ def _malformed_500_body(raw_input: str) -> str:
         "error": {
             "code": 500,
             "message": f"Failed to parse input at pos 84: {raw_input}",
+            "type": "server_error",
+        }
+    })
+
+
+def _renamed_500_body(raw_input: str) -> str:
+    """A 500 from a hypothetical llama.cpp build that RENAMED the parse-error
+    phrase but still embeds the raw generation — deliberately contains NO
+    "Failed to parse input". Proves the rescue gate is structural, not pinned
+    to any error string."""
+    return json.dumps({
+        "error": {
+            "code": 500,
+            "message": (
+                "The model produced output that does not match the expected "
+                f"format: {raw_input}"
+            ),
+            "type": "server_error",
+        }
+    })
+
+
+def _b9656_generic_parse_500_body() -> str:
+    """The post-581e8eca8 (b9656+) parse-rejection body: a generic format
+    complaint with the rejected generation moved to server logs — no tool-call
+    XML tokens in the body. Shape confirmed against a live b9656+ build."""
+    return json.dumps({
+        "error": {
+            "code": 500,
+            "message": (
+                "Failed to parse tool call: generated output does not match "
+                "the expected format"
+            ),
             "type": "server_error",
         }
     })
@@ -171,11 +208,12 @@ class TestLlamafileNativeSend:
         assert "Failed to parse input" not in result.content  # raw JSON must not leak
 
     @pytest.mark.asyncio
-    async def test_malformed_500_reparses_skeleton_and_complete_call(self) -> None:
+    async def test_malformed_500_stutter_returns_only_complete_call(self) -> None:
         # The write-stutter: a skeleton (path-only) block followed by the same
         # call complete WITH content. llama.cpp 500s the whole generation; both
-        # calls ride in the error body — return BOTH and let downstream decide
-        # (skeleton TypeErrors on the tool channel, complete call executes).
+        # ride in the error body. Rescue drops the skeleton (missing required
+        # `content`) and returns ONLY the complete call — dispatching the
+        # skeleton would [ToolError] and drive tool-error exhaustion.
         client = _make_client("native")
         resp = MagicMock()
         resp.status_code = 500
@@ -185,18 +223,17 @@ class TestLlamafileNativeSend:
             [{"role": "user", "content": "test"}], tools=[_make_write_spec()]
         )
         assert isinstance(result, list)
-        assert len(result) == 2
+        assert len(result) == 1
         assert result[0].tool == "write"
-        assert result[0].args == {"file_path": "tests/test_x.py"}  # skeleton, as emitted
-        assert result[1].tool == "write"
-        assert result[1].args["file_path"] == "tests/test_x.py"
-        assert result[1].args["content"].startswith("import unittest")
-        assert result[1].args["content"].endswith("    pass")
-        assert client.rescued_tool_calls == 2
+        assert result[0].args["file_path"] == "tests/test_x.py"
+        assert result[0].args["content"].startswith("import unittest")
+        assert result[0].args["content"].endswith("    pass")
+        assert client.rescued_tool_calls == 1
 
     @pytest.mark.asyncio
     async def test_malformed_500_rescue_dedupes_repeated_blocks(self) -> None:
-        # Stutters can repeat blocks — identical (tool, args) collapse to one.
+        # Stutters can repeat blocks. Skeletons drop (missing `content`); the
+        # two identical completes collapse to one via the (tool, args) dedupe.
         client = _make_client("native")
         resp = MagicMock()
         resp.status_code = 500
@@ -208,13 +245,16 @@ class TestLlamafileNativeSend:
             [{"role": "user", "content": "test"}], tools=[_make_write_spec()]
         )
         assert isinstance(result, list)
-        assert len(result) == 2  # one skeleton + one complete
+        assert len(result) == 1  # skeletons dropped, completes deduped
+        assert result[0].args["content"].startswith("import unittest")
+        assert client.rescued_tool_calls == 1
 
     @pytest.mark.asyncio
-    async def test_malformed_500_skeleton_only_returned_as_call(self) -> None:
-        # Skeleton block alone: returned as a real ToolCall so the runner's
-        # dispatch rejects it with [ToolError] TypeError on the tool channel —
-        # the canonical corrective signal — instead of canned self-talk text.
+    async def test_malformed_500_skeleton_only_returns_nudge(self) -> None:
+        # Skeleton block alone (missing required `content`): dropped by rescue,
+        # so no call is dispatched. The caller falls through to the stutter
+        # nudge (a clean re-emit instruction) instead of a broken tool call —
+        # this is what breaks the rig-04 tool-error exhaustion loop.
         client = _make_client("native")
         resp = MagicMock()
         resp.status_code = 500
@@ -223,11 +263,56 @@ class TestLlamafileNativeSend:
         result = await client.send(
             [{"role": "user", "content": "test"}], tools=[_make_write_spec()]
         )
+        assert isinstance(result, TextResponse)
+        assert "ONE complete" in result.content  # stutter-specific nudge
+        assert "Failed to parse input" not in result.content  # raw JSON must not leak
+        assert client.rescued_tool_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_malformed_500_no_required_params_partial_survives(self) -> None:
+        # A tool with NO required params: even a bare block satisfies the
+        # required-set check (empty set ⊆ anything) and must be returned, not
+        # over-suppressed by the skeleton filter.
+        client = _make_client("native")
+        resp = MagicMock()
+        resp.status_code = 500
+        # PartParams.part is required in _make_spec; build a no-required spec.
+        no_req_spec = ToolSpec(
+            name="ping", description="ping", parameters=_NoRequiredParams
+        )
+        resp.text = _malformed_500_body(
+            "<tool_call>\n<function=ping>\n</function>\n</tool_call>"
+        )
+        client._http.post.return_value = resp
+        result = await client.send(
+            [{"role": "user", "content": "test"}], tools=[no_req_spec]
+        )
         assert isinstance(result, list)
         assert len(result) == 1
-        assert result[0].tool == "write"
-        assert result[0].args == {"file_path": "tests/test_x.py"}
+        assert result[0].tool == "ping"
+        assert result[0].args == {}
         assert client.rescued_tool_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_malformed_500_two_distinct_complete_calls_both_survive(self) -> None:
+        # The required filter must not over-drop: two distinct COMPLETE calls
+        # both pass and are returned.
+        client = _make_client("native")
+        resp = MagicMock()
+        resp.status_code = 500
+        second_complete = _COMPLETE_BLOCK.replace("tests/test_x.py", "tests/test_y.py")
+        resp.text = _malformed_500_body(f"{_COMPLETE_BLOCK}\n{second_complete}")
+        client._http.post.return_value = resp
+        result = await client.send(
+            [{"role": "user", "content": "test"}], tools=[_make_write_spec()]
+        )
+        assert isinstance(result, list)
+        assert len(result) == 2
+        assert {c.args["file_path"] for c in result} == {
+            "tests/test_x.py",
+            "tests/test_y.py",
+        }
+        assert client.rescued_tool_calls == 2
 
     @pytest.mark.asyncio
     async def test_malformed_500_without_blocks_keeps_generic_nudge(self) -> None:
@@ -267,16 +352,116 @@ class TestLlamafileNativeSend:
     @pytest.mark.asyncio
     async def test_arbitrary_500_cascades_as_backend_error(self) -> None:
         # A real backend 500 (not a tool-call parse rejection) must cascade, not
-        # be swallowed as a retryable text response.
+        # be swallowed as a retryable text response. The raw body is passed as
+        # raw_body= — kept off the message (a gateway could echo a credential
+        # into it) but available on exc.body for debugging.
         client = _make_client("native")
         resp = MagicMock()
         resp.status_code = 500
         resp.text = '{"error":{"message":"CUDA out of memory","type":"server_error"}}'
         client._http.post.return_value = resp
-        with pytest.raises(BackendError):
+        with pytest.raises(BackendError) as excinfo:
             await client.send(
                 [{"role": "user", "content": "test"}], tools=[_make_spec()]
             )
+        assert "CUDA out of memory" not in str(excinfo.value)  # raw body off message
+        assert "CUDA out of memory" in excinfo.value.body      # but kept for debugging
+
+    @pytest.mark.asyncio
+    async def test_malformed_500_rescued_without_parse_phrase(self) -> None:
+        # A build that RENAMED the parse-error phrase (no "Failed to parse
+        # input") but still embeds the generation must still rescue: the gate
+        # is structural (tool-call XML present), not phrase-pinned.
+        client = _make_client("native")
+        resp = MagicMock()
+        resp.status_code = 500
+        resp.text = _renamed_500_body(_COMPLETE_BLOCK)
+        assert "Failed to parse input" not in resp.text  # the point of the test
+        client._http.post.return_value = resp
+        result = await client.send(
+            [{"role": "user", "content": "test"}], tools=[_make_write_spec()]
+        )
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert result[0].args["content"].startswith("import unittest")
+        assert client.rescued_tool_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_malformed_500_no_phrase_skeleton_only_returns_nudge(self) -> None:
+        # Renamed phrase + skeleton only → skeleton dropped, stutter nudge.
+        client = _make_client("native")
+        resp = MagicMock()
+        resp.status_code = 500
+        resp.text = _renamed_500_body(_SKELETON_BLOCK)
+        client._http.post.return_value = resp
+        result = await client.send(
+            [{"role": "user", "content": "test"}], tools=[_make_write_spec()]
+        )
+        assert isinstance(result, TextResponse)
+        assert "ONE complete" in result.content
+        assert client.rescued_tool_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_tools_schema_dump_500_cascades(self) -> None:
+        # "Failed to parse tools" dumps the tools JSON schema (contains
+        # "function" but never the <function=/<tool_call> XML tokens) → not a
+        # rescuable generation artifact → cascade.
+        client = _make_client("native")
+        resp = MagicMock()
+        resp.status_code = 500
+        resp.text = json.dumps({
+            "error": {
+                "message": 'Failed to parse tools: bad schema; tools = '
+                           '[{"type":"function","function":{"name":"write"}}]',
+                "type": "server_error",
+            }
+        })
+        client._http.post.return_value = resp
+        with pytest.raises(BackendError):
+            await client.send(
+                [{"role": "user", "content": "test"}], tools=[_make_write_spec()]
+            )
+
+    @pytest.mark.asyncio
+    async def test_truncated_open_tag_500_returns_generic_nudge(self) -> None:
+        # Echo cut off mid-open-tag (EOS/token budget inside "<tool_call") is
+        # still a generation artifact: the unclosed-prefix gate matches, no
+        # block parses, and the GENERIC nudge (not stutter — no visible block)
+        # comes back retryable instead of cascading.
+        client = _make_client("native")
+        resp = MagicMock()
+        resp.status_code = 500
+        resp.text = json.dumps({
+            "error": {
+                "code": 500,
+                "message": "Failed to parse input at pos 84: <tool_call",
+                "type": "server_error",
+            }
+        })
+        client._http.post.return_value = resp
+        result = await client.send(
+            [{"role": "user", "content": "test"}], tools=[_make_write_spec()]
+        )
+        assert isinstance(result, TextResponse)
+        assert "ONE complete" not in result.content  # generic, not stutter
+        assert client.rescued_tool_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_b9656_generic_parse_500_cascades(self) -> None:
+        # VERSION BOUNDARY (see _is_malformed_tool_call_500): b9656+ no longer
+        # echoes the rejected generation into the 500 body, so the structural
+        # gate must NOT match — the parse 500 cascades as a real BackendError
+        # instead of entering the retry-nudge loop with nothing to rescue.
+        client = _make_client("native")
+        resp = MagicMock()
+        resp.status_code = 500
+        resp.text = _b9656_generic_parse_500_body()
+        client._http.post.return_value = resp
+        with pytest.raises(BackendError):
+            await client.send(
+                [{"role": "user", "content": "test"}], tools=[_make_write_spec()]
+            )
+        assert client.rescued_tool_calls == 0
 
     @pytest.mark.asyncio
     async def test_missing_choices_raises_backend_error(self) -> None:
@@ -687,6 +872,39 @@ class _MockSSEStreamResponse:
         pass
 
 
+class _MockSSE500Response:
+    """Mock httpx streaming response that returns a 500 error body.
+
+    Yields the body as a SINGLE line — llama.cpp's 500 is compact single-line
+    JSON (embedded newlines are JSON-escaped), matching how send_stream
+    reassembles error_body by concatenation.
+    """
+
+    status_code = 500
+
+    def __init__(self, body: str, split: bool = False) -> None:
+        self._body = body
+        self._split = split
+
+    async def aiter_lines(self):
+        # aiter_lines() strips terminators; send_stream reassembles via
+        # concatenation. When split=True, deliver the body across several
+        # lines to exercise that reassembly (llama.cpp's compact JSON escapes
+        # its own newlines, so splitting on ", " is a faithful stand-in).
+        if self._split:
+            parts = self._body.split(",")
+            for i, part in enumerate(parts):
+                yield part + ("," if i < len(parts) - 1 else "")
+        else:
+            yield self._body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+
 class TestLlamafileSendStream:
     @pytest.mark.asyncio
     async def test_yields_text_deltas_and_final(self) -> None:
@@ -805,6 +1023,180 @@ class TestLlamafileSendStream:
         final = [c for c in chunks if c.type == ChunkType.FINAL][0]
         assert isinstance(final.response, list)
         assert final.response[0].reasoning is None
+
+    # ── send_stream — malformed-500 rescue (streaming twins) ──────────
+
+    @pytest.mark.asyncio
+    async def test_stream_malformed_500_stutter_returns_only_complete(self) -> None:
+        # Streaming twin: skeleton+complete stutter → FINAL is the complete
+        # call alone; the skeleton is dropped inside rescue.
+        client = _make_client("native")
+        client._http.stream.return_value = _MockSSE500Response(
+            _malformed_500_body(f"{_SKELETON_BLOCK}\n{_COMPLETE_BLOCK}")
+        )
+        chunks = [
+            c async for c in client.send_stream(
+                [{"role": "user", "content": "test"}], tools=[_make_write_spec()]
+            )
+        ]
+        finals = [c for c in chunks if c.type == ChunkType.FINAL]
+        assert len(finals) == 1
+        assert isinstance(finals[0].response, list)
+        assert len(finals[0].response) == 1
+        assert finals[0].response[0].tool == "write"
+        assert finals[0].response[0].args["content"].startswith("import unittest")
+        assert client.rescued_tool_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_stream_malformed_500_skeleton_only_returns_nudge(self) -> None:
+        # Streaming twin of the inverted native test: skeleton alone → dropped,
+        # FINAL is the stutter nudge TextResponse, nothing rescued.
+        client = _make_client("native")
+        client._http.stream.return_value = _MockSSE500Response(
+            _malformed_500_body(_SKELETON_BLOCK)
+        )
+        chunks = [
+            c async for c in client.send_stream(
+                [{"role": "user", "content": "test"}], tools=[_make_write_spec()]
+            )
+        ]
+        finals = [c for c in chunks if c.type == ChunkType.FINAL]
+        assert len(finals) == 1
+        assert isinstance(finals[0].response, TextResponse)
+        assert "ONE complete" in finals[0].response.content
+        assert "Failed to parse input" not in finals[0].response.content
+        assert client.rescued_tool_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_stream_malformed_500_no_blocks_keeps_generic_nudge(self) -> None:
+        # Fingerprint matches but no <tool_call> block visible → generic nudge.
+        client = _make_client("native")
+        client._http.stream.return_value = _MockSSE500Response(
+            _malformed_500_body("<function=write> garbled fragment")
+        )
+        chunks = [
+            c async for c in client.send_stream(
+                [{"role": "user", "content": "test"}], tools=[_make_write_spec()]
+            )
+        ]
+        final = [c for c in chunks if c.type == ChunkType.FINAL][0]
+        assert isinstance(final.response, TextResponse)
+        assert "Re-emitting a single, complete, well-formed tool call" in final.response.content
+        assert client.rescued_tool_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_stream_malformed_500_unknown_tool_not_fabricated(self) -> None:
+        # A block naming a tool absent from the request → never fabricated.
+        client = _make_client("native")
+        client._http.stream.return_value = _MockSSE500Response(
+            _malformed_500_body(
+                "<tool_call>\n<function=rm_rf>\n<parameter=path>\n/\n</parameter>\n"
+                "</function>\n</tool_call>"
+            )
+        )
+        chunks = [
+            c async for c in client.send_stream(
+                [{"role": "user", "content": "test"}], tools=[_make_write_spec()]
+            )
+        ]
+        final = [c for c in chunks if c.type == ChunkType.FINAL][0]
+        assert isinstance(final.response, TextResponse)
+        assert client.rescued_tool_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_stream_malformed_500_reassembles_multiline_body(self) -> None:
+        # The one path unique to streaming: error_body is reassembled from
+        # aiter_lines() by concatenation. Deliver the body across multiple
+        # lines and confirm the complete call still parses out of it.
+        client = _make_client("native")
+        client._http.stream.return_value = _MockSSE500Response(
+            _malformed_500_body(f"{_SKELETON_BLOCK}\n{_COMPLETE_BLOCK}"), split=True
+        )
+        chunks = [
+            c async for c in client.send_stream(
+                [{"role": "user", "content": "test"}], tools=[_make_write_spec()]
+            )
+        ]
+        finals = [c for c in chunks if c.type == ChunkType.FINAL]
+        assert len(finals) == 1
+        assert isinstance(finals[0].response, list)
+        assert len(finals[0].response) == 1
+        assert finals[0].response[0].args["content"].startswith("import unittest")
+        assert client.rescued_tool_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_stream_malformed_500_rescued_without_parse_phrase(self) -> None:
+        # Streaming twin: the shared gate is structural, so a renamed-phrase
+        # body embedding a complete block rescues on the streaming path too.
+        client = _make_client("native")
+        client._http.stream.return_value = _MockSSE500Response(
+            _renamed_500_body(_COMPLETE_BLOCK)
+        )
+        chunks = [
+            c async for c in client.send_stream(
+                [{"role": "user", "content": "test"}], tools=[_make_write_spec()]
+            )
+        ]
+        finals = [c for c in chunks if c.type == ChunkType.FINAL]
+        assert len(finals) == 1
+        assert isinstance(finals[0].response, list)
+        assert len(finals[0].response) == 1
+        assert client.rescued_tool_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_stream_arbitrary_500_cascades(self) -> None:
+        # A real backend 500 must cascade; raw body kept off the message but on
+        # exc.body (same guarantee as the native path).
+        client = _make_client("native")
+        client._http.stream.return_value = _MockSSE500Response(
+            '{"error":{"message":"CUDA out of memory","type":"server_error"}}'
+        )
+        with pytest.raises(BackendError) as excinfo:
+            async for _ in client.send_stream(
+                [{"role": "user", "content": "test"}], tools=[_make_spec()]
+            ):
+                pass
+        assert "CUDA out of memory" not in str(excinfo.value)
+        assert "CUDA out of memory" in excinfo.value.body
+
+    @pytest.mark.asyncio
+    async def test_stream_truncated_open_tag_500_returns_generic_nudge(self) -> None:
+        # Streaming twin: a mid-open-tag truncation stays retryable here too.
+        client = _make_client("native")
+        client._http.stream.return_value = _MockSSE500Response(
+            json.dumps({
+                "error": {
+                    "code": 500,
+                    "message": "Failed to parse input at pos 84: <tool_call",
+                    "type": "server_error",
+                }
+            })
+        )
+        chunks = [
+            c async for c in client.send_stream(
+                [{"role": "user", "content": "test"}], tools=[_make_write_spec()]
+            )
+        ]
+        finals = [c for c in chunks if c.type == ChunkType.FINAL]
+        assert len(finals) == 1
+        assert isinstance(finals[0].response, TextResponse)
+        assert "ONE complete" not in finals[0].response.content
+        assert client.rescued_tool_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_stream_b9656_generic_parse_500_cascades(self) -> None:
+        # Streaming twin: the no-echo b9656+ parse rejection cascades on the
+        # streaming path too (shared structural gate).
+        client = _make_client("native")
+        client._http.stream.return_value = _MockSSE500Response(
+            _b9656_generic_parse_500_body()
+        )
+        with pytest.raises(BackendError):
+            async for _ in client.send_stream(
+                [{"role": "user", "content": "test"}], tools=[_make_write_spec()]
+            ):
+                pass
+        assert client.rescued_tool_calls == 0
 
 
 # ── mode ─────────────────────────────────────────────────────────

@@ -48,10 +48,27 @@ _KNOWN_GGUF_EXTENSIONS: tuple[str, ...] = (".gguf", ".llamafile")
 # — NOT an arbitrary backend error. This one is a transient sampling artifact and
 # recoverable by re-sampling, so we surface it as a retryable text response (the
 # run_inference retry loop nudges the model to re-emit a clean call) instead of
-# echoing the raw error JSON into the conversation. Every OTHER 500 cascades as a
-# BackendError.
+# echoing the raw error JSON into the conversation. Every OTHER 500 cascades.
+#
+# The gate is STRUCTURAL, not phrase-based: a 500 is rescuable iff its body
+# carries generated tool-call XML (``<tool_call``/``<function=``). Only the
+# model generating such a call and the backend choking on it puts that syntax in
+# a 500 body — genuine faults (OOM/slot/context/CUDA) never echo generation, and
+# a request-parse failure dumps JSON, not this XML. ``<tool_call`` is
+# deliberately unclosed: an echo truncated mid-open-tag (EOS or token budget
+# landing inside the tag) is the same re-sampleable artifact as a complete one,
+# and the leading ``<`` keeps the gate structural — request and schema dumps
+# carry ``"tool_calls"`` as quoted JSON, never the tag.
+#
+# VERSION BOUNDARY: rescue only fires on llama.cpp builds that echo the raw
+# rejected generation into the 500 body. That ended at commit 581e8eca8
+# ("chat: harden peg-native tool call parsing", PR #24329, first in tag b9656,
+# 2026-06-15): the exception became a generic "...does not match the expected
+# <format> format" and the raw generation moved to server logs only. On b9656+
+# this gate never matches, and grammar hardening in the same series makes the
+# malformed call rare anyway, so the 500 just cascades. Effective only on <= b9647.
 def _is_malformed_tool_call_500(body: str) -> bool:
-    return "Failed to parse input" in body and ("tool_call" in body or "<function=" in body)
+    return "<tool_call" in body or "<function=" in body
 
 
 _MALFORMED_TOOL_CALL_RETRY_TEXT = (
@@ -60,12 +77,12 @@ _MALFORMED_TOOL_CALL_RETRY_TEXT = (
     "single, complete, well-formed tool call.)"
 )
 
-# Used only when the 500 body demonstrably contains <tool_call> block(s) but
-# none re-parse to a tool from the request (mangled syntax or unknown tool
-# names) — i.e. we KNOW the model emitted a defective call block. A
+# Used when the 500 body demonstrably contains <tool_call> block(s) but none
+# survive rescue — either mangled syntax / unknown tool names, or (the common
+# case) skeleton/preview blocks dropped for missing a required parameter. A
 # malformed-500 without visible blocks keeps the generic text above; we don't
-# name a stutter we haven't seen. Parseable blocks — skeletons included — are
-# returned as real ToolCalls instead (see _rescue_tool_calls).
+# name a stutter we haven't seen. Complete blocks are returned as real
+# ToolCalls and never reach this text (see _rescue_tool_calls).
 _STUTTER_RETRY_TEXT = (
     "(The previous response contained a malformed tool-call block — a "
     "preview/skeleton call missing its required parameters, or a duplicated "
@@ -135,20 +152,25 @@ def _rescue_tool_calls(
     error_body: str,
     tools_array: list[dict[str, Any]] | None,
 ) -> tuple[list[ToolCall], bool]:
-    """Leniently re-parse tool calls out of a malformed-tool-call 500 body.
+    """Re-parse the COMPLETE tool calls out of a malformed-tool-call 500 body.
 
-    Returns ``(calls, saw_blocks)``. Every block that parses and names a tool
-    present in the request's ``tools`` array is returned — including
-    skeleton/preview blocks missing required parameters. Validity is decided
-    downstream: the ResponseValidator and the runner's ``fn(**args)`` dispatch
-    reject a skeleton with a ``[ToolError] TypeError`` on the tool channel
-    (the canonical corrective signal), while complete calls simply execute.
-    Unknown tool names are never returned (nothing we can't check against the
+    Returns ``(calls, saw_blocks)``. A block is returned only when it parses,
+    names a tool present in the request's ``tools`` array, AND carries every
+    parameter that tool marks required. Skeleton/preview blocks missing a
+    required param are DROPPED — dispatching them would raise a
+    ``[ToolError] TypeError`` on the tool channel and, in the write-stutter
+    case (skeleton immediately followed by the complete call), drive the model
+    into consecutive-tool-error exhaustion. The complete call from that same
+    stutter survives the filter and is returned alone; a skeleton-only body
+    yields no calls, so the caller falls through to a clean re-emit nudge.
+
+    Unknown tool names are never returned (nothing we can check against the
     request), exact duplicates are deduped, and param values are coerced to
     their declared schema types where possible (kept as raw strings when
-    coercion fails — the tool decides). ``saw_blocks`` reports whether any
-    ``<tool_call>`` block was visible at all — it selects the
-    stutter-specific retry text when parsing comes up empty.
+    coercion fails, matching the native path — a present-but-malformed arg
+    still satisfies the required-set check and the tool decides). ``saw_blocks``
+    reports whether any ``<tool_call>`` block was visible at all — it selects
+    the stutter-specific retry text when parsing comes up empty.
     """
     try:
         message = json.loads(error_body).get("error", {}).get("message", "")
@@ -165,13 +187,15 @@ def _rescue_tool_calls(
         spec = requirements.get(name)
         if spec is None:
             continue  # unknown tool — never fabricate a call we can't check
-        _required, types = spec
+        required, types = spec
         args: dict[str, Any] = {}
         for key, raw_value in _TOOL_PARAM_RE.findall(params_text):
             try:
                 args[key] = _coerce_param(raw_value, types.get(key))
             except ValueError:
                 args[key] = raw_value
+        if not required.issubset(args):
+            continue  # skeleton/preview block missing a required param — drop it
         dedupe_key = (name, json.dumps(args, sort_keys=True, default=str))
         if dedupe_key in seen:
             continue
@@ -560,10 +584,10 @@ class LlamafileClient:
                 async for line in response.aiter_lines():
                     error_body += line
                 if _is_malformed_tool_call_500(error_body):
-                    # Leniently re-parse the model's calls out of the 500 body
-                    # and hand them downstream: complete calls execute,
-                    # skeletons get rejected by dispatch as [ToolError] on the
-                    # tool channel.
+                    # Re-parse the model's COMPLETE calls out of the 500 body
+                    # and hand them downstream to execute; skeletons missing a
+                    # required param are dropped inside _rescue_tool_calls so
+                    # they never reach dispatch.
                     calls, saw_blocks = _rescue_tool_calls(
                         error_body, body.get("tools")
                     )
@@ -586,8 +610,8 @@ class LlamafileClient:
                         ),
                     )
                     return
-                # Arbitrary backend 500 — cascade.
-                raise BackendError(500, error_body)
+                # Arbitrary backend 500 — cascade. Raw body off the message.
+                raise BackendError(500, raw_body=error_body)
             async for line in response.aiter_lines():
                 line = line.strip()
                 if not line or not line.startswith("data: "):
@@ -757,9 +781,10 @@ class LlamafileClient:
         if resp.status_code == 500:
             is_parse = _is_malformed_tool_call_500(resp.text)
             if is_parse:
-                # Leniently re-parse the model's calls out of the 500 body and
-                # hand them downstream: complete calls execute, skeletons get
-                # rejected by dispatch as [ToolError] on the tool channel.
+                # Re-parse the model's COMPLETE calls out of the 500 body and
+                # hand them downstream to execute; skeletons missing a required
+                # param are dropped inside _rescue_tool_calls so they never
+                # reach dispatch.
                 calls, saw_blocks = _rescue_tool_calls(resp.text, body.get("tools"))
                 if calls:
                     self.rescued_tool_calls += len(calls)
@@ -775,8 +800,8 @@ class LlamafileClient:
                     content=_STUTTER_RETRY_TEXT if saw_blocks
                     else _MALFORMED_TOOL_CALL_RETRY_TEXT
                 )
-            # Arbitrary backend 500 — cascade.
-            raise BackendError(500, resp.text)
+            # Arbitrary backend 500 — cascade. Raw body off the message.
+            raise BackendError(500, raw_body=resp.text)
         if resp.status_code != 200:
             raise BackendError(resp.status_code, raw_body=resp.text)
         data = resp.json()
@@ -784,7 +809,11 @@ class LlamafileClient:
 
         choices = data.get("choices") or []
         if not choices:
-            raise BackendError(500, f"response has no choices: {data}")
+            # Raw envelope off the message (a gateway could echo a credential
+            # into a 200 body too); kept on exc.body for debugging.
+            raise BackendError(
+                500, "response has no choices", raw_body=json.dumps(data, default=str)
+            )
         choice = choices[0].get("message", {})
         raw_tool_calls = choice.get("tool_calls")
         if raw_tool_calls:
